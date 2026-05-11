@@ -1,0 +1,406 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+ESC=$(printf '\033')
+
+usage() {
+  cat <<'USAGE'
+usage: task [command]
+
+commands:
+  switch                 open the native dense fzf palette
+  list                   list discovered git worktree tasks
+  status <name>          print one task status line
+  open <name> [path]     switch/create tmux window for a task
+  new [name]             create branch + worktree + tmux window
+  run <name> <cmd...>    send command to a task tmux window
+  archive <name> [path]  safely remove a clean worktree and tmux window
+
+shortcuts:
+  -d, --delete          pick one or more worktrees to archive
+USAGE
+}
+
+has() { command -v "$1" >/dev/null 2>&1; }
+
+require() {
+  has "$1" || {
+    echo "task: missing dependency: $1" >&2
+    exit 1
+  }
+}
+
+repo_root() { git rev-parse --show-toplevel; }
+project_name() { basename "$(repo_root)"; }
+
+sanitize_window_name() {
+  printf '%s' "$1" | tr '/: ' '---'
+}
+
+strip_ansi() {
+  sed $'s/\033\[[0-9;]*m//g'
+}
+
+ansi_len() {
+  printf '%s' "$1" | strip_ansi | awk '{ print length }'
+}
+
+terminal_width() {
+  local cols
+  cols=$(tput cols 2>/dev/null || true)
+  if [ -z "$cols" ] || [ "$cols" -lt 40 ]; then
+    cols=100
+  fi
+  printf '%s' "$cols"
+}
+
+pad_right() {
+  local text="$1" width="$2"
+  local len pad spaces
+  len=$(ansi_len "$text")
+  pad=$(( width - len ))
+  spaces=$(( pad > 0 ? pad : 0 ))
+  printf '%s%*s' "$text" "$spaces" ''
+}
+
+shortcut_badge() {
+  printf '%s' "${ESC}[30;43;1m $1 ${ESC}[0m"
+}
+
+format_row() {
+  local action="$1" name="$2" path="$3" description="$4" shortcut="$5"
+  local width left badge left_width display
+
+  width="${TASK_PALETTE_WIDTH:-$(terminal_width)}"
+  badge=$(shortcut_badge "$shortcut")
+  left="${ESC}[32;1m${name}${ESC}[0m  ${ESC}[2m${description}${ESC}[0m"
+  left_width=$(( width - $(ansi_len "$badge") - 6 ))
+  [ "$left_width" -lt 30 ] && left_width=30
+  display="$(pad_right "$left" "$left_width")  $badge"
+
+  # Hidden parse fields first; rendered display field last.
+  printf '%s\t%s\t%s\t%s\n' "$action" "$name" "$path" "$display"
+}
+
+list_worktrees() {
+  git worktree list --porcelain | awk '
+    /^worktree / { path=$2; branch="" }
+    /^branch / {
+      branch=$2
+      sub("refs/heads/", "", branch)
+      name=branch
+      print name "\t" path "\t" branch
+    }
+  '
+}
+
+path_for_task() {
+  local wanted="$1"
+  list_worktrees | awk -F '\t' -v wanted="$wanted" '$1 == wanted { print $2; found=1; exit } END { exit found ? 0 : 1 }'
+}
+
+window_id_for_name() {
+  local window_name="$1"
+  tmux list-windows -F '#{window_id}	#{window_name}' 2>/dev/null | awk -F '\t' -v wanted="$window_name" '$2 == wanted { print $1; found=1; exit } END { exit found ? 0 : 1 }'
+}
+
+window_exists() {
+  window_id_for_name "$1" >/dev/null 2>&1
+}
+
+detect_port() {
+  local path="$1"
+  local file port
+
+  for file in "$path/.task/port" "$path/.port"; do
+    if [ -f "$file" ]; then
+      port=$(head -n 1 "$file" | tr -cd '0-9')
+      [ -n "$port" ] && { printf '%s' "$port"; return 0; }
+    fi
+  done
+
+  return 1
+}
+
+task_meta() {
+  local path="$1" name="${2:-}"
+  local dirty window port
+
+  dirty=$(git -C "$path" status --short | wc -l | tr -d ' ')
+  if [ "$dirty" = "0" ]; then
+    dirty="clean"
+  else
+    dirty="$dirty modified"
+  fi
+
+  window="no window"
+  if [ -n "$name" ] && window_exists "$(sanitize_window_name "$name")"; then
+    window="window open"
+  fi
+
+  port=$(detect_port "$path" || true)
+  if [ -n "$port" ]; then
+    printf '%s · %s · :%s' "$dirty" "$window" "$port"
+  else
+    printf '%s · %s' "$dirty" "$window"
+  fi
+}
+
+build_rows() {
+  local name path branch meta
+
+  list_worktrees | while IFS=$'\t' read -r name path branch; do
+    meta=$(task_meta "$path" "$name")
+    format_row "switch" "$name" "$path" "$meta" "enter"
+  done
+
+  format_row "new" "+ new task" "" "branch + worktree + tmux window" "ctrl-n"
+}
+
+build_archive_rows() {
+  local name path branch meta current_root
+
+  current_root=$(repo_root)
+  list_worktrees | while IFS=$'\t' read -r name path branch; do
+    [ "$path" = "$current_root" ] && continue
+    meta=$(task_meta "$path" "$name")
+    format_row "archive" "$name" "$path" "$meta" "tab"
+  done
+}
+
+task_list() {
+  local name path branch
+  list_worktrees | while IFS=$'\t' read -r name path branch; do
+    printf '%s\t%s\t%s\n' "$name" "$path" "$(task_meta "$path" "$name")"
+  done
+}
+
+task_status() {
+  local name="${1:-}" path
+  [ -n "$name" ] || { echo "task: status requires a task name" >&2; exit 2; }
+  path=$(path_for_task "$name") || { echo "task: unknown task: $name" >&2; exit 1; }
+  task_meta "$path" "$name"
+  printf '\n'
+}
+
+task_open() {
+  local name="${1:-}" path="${2:-}" window_name window_id
+  [ -n "$name" ] || { echo "task: open requires a task name" >&2; exit 2; }
+  require tmux
+
+  [ -n "$path" ] || path=$(path_for_task "$name") || { echo "task: unknown task: $name" >&2; exit 1; }
+  window_name=$(sanitize_window_name "$name")
+
+  if window_id=$(window_id_for_name "$window_name"); then
+    tmux select-window -t "$window_id"
+  else
+    tmux new-window -n "$window_name" -c "$path"
+  fi
+}
+
+validate_task_name() {
+  local name="$1"
+  case "$name" in
+    ""|*" "*|*".."*|/*)
+      echo "task: invalid task name: $name" >&2
+      echo "task: use a branch-safe name like auth-redesign or perf/pass" >&2
+      exit 2
+      ;;
+  esac
+}
+
+task_new() {
+  local name="${1:-}" project path hook_source hook_dest
+  require git
+  require tmux
+
+  if [ -z "$name" ]; then
+    read -r -p "task name: " name
+  fi
+  validate_task_name "$name"
+
+  project=$(project_name)
+  path="../${project}-$(sanitize_window_name "$name")"
+
+  git worktree add "$path" -b "$name"
+
+  hook_source="$(repo_root)/.task/after-new"
+  hook_dest="$path/.task/after-new"
+  if [ -x "$hook_source" ]; then
+    (cd "$path" && "$hook_source" "$name")
+  fi
+
+  task_open "$name" "$path"
+}
+
+task_run() {
+  local name="${1:-}" path window_name window_id command
+  [ -n "$name" ] || { echo "task: run requires a task name" >&2; exit 2; }
+  shift || true
+  [ "$#" -gt 0 ] || { echo "task: run requires a command" >&2; exit 2; }
+  require tmux
+
+  command="$*"
+  path=$(path_for_task "$name") || { echo "task: unknown task: $name" >&2; exit 1; }
+  window_name=$(sanitize_window_name "$name")
+
+  if ! window_id=$(window_id_for_name "$window_name"); then
+    tmux new-window -d -n "$window_name" -c "$path"
+    window_id=$(window_id_for_name "$window_name")
+  fi
+
+  tmux send-keys -t "$window_id" "$command" C-m
+}
+
+archive_one() {
+  local name="$1" path="$2" window_name window_id
+
+  window_name=$(sanitize_window_name "$name")
+  if window_id=$(window_id_for_name "$window_name"); then
+    tmux kill-window -t "$window_id"
+  fi
+
+  git worktree remove "$path"
+  echo "Archived $name. Branch left intact."
+}
+
+task_archive() {
+  local name="${1:-}" path="${2:-}" confirm
+  [ -n "$name" ] || { echo "task: archive requires a task name" >&2; exit 2; }
+  require git
+  require tmux
+
+  [ -n "$path" ] || path=$(path_for_task "$name") || { echo "task: unknown task: $name" >&2; exit 1; }
+
+  if [ -n "$(git -C "$path" status --short)" ]; then
+    echo "task: $name has uncommitted changes; refusing to archive" >&2
+    exit 1
+  fi
+
+  read -r -p "Archive $name? remove worktree and kill tmux window [y/N] " confirm
+  [ "$confirm" = "y" ] || exit 0
+
+  archive_one "$name" "$path"
+}
+
+task_archive_picker() {
+  local selected line name path dirty_count=0 clean_count=0 confirm
+  local clean_names=() clean_paths=() dirty_names=()
+  require git
+  require tmux
+  require fzf
+
+  selected=$(
+    build_archive_rows |
+      fzf \
+        --prompt='ARCHIVE › ' \
+        --height='100%' \
+        --layout=reverse \
+        --ansi \
+        --multi \
+        --delimiter=$'\t' \
+        --with-nth=4 \
+        --header='tab: select  enter: archive selected  ctrl-a: select all' \
+        --bind='ctrl-a:select-all,ctrl-d:deselect-all'
+  ) || return 0
+
+  [ -n "$selected" ] || return 0
+
+  while IFS= read -r line; do
+    [ -n "$line" ] || continue
+    name=$(printf '%s' "$line" | cut -f2)
+    path=$(printf '%s' "$line" | cut -f3)
+
+    if [ -n "$(git -C "$path" status --short)" ]; then
+      dirty_names+=("$name")
+      dirty_count=$((dirty_count + 1))
+    else
+      clean_names+=("$name")
+      clean_paths+=("$path")
+      clean_count=$((clean_count + 1))
+    fi
+  done <<EOF
+$selected
+EOF
+
+  if [ "$dirty_count" -gt 0 ]; then
+    echo "task: skipping dirty worktree(s): ${dirty_names[*]}" >&2
+  fi
+
+  [ "$clean_count" -gt 0 ] || { echo "task: no clean worktrees selected to archive" >&2; return 1; }
+
+  printf 'Archive %s clean worktree(s)? remove worktrees and kill tmux windows [y/N] ' "$clean_count"
+  read -r confirm
+  [ "$confirm" = "y" ] || return 0
+
+  local i=0
+  while [ "$i" -lt "$clean_count" ]; do
+    archive_one "${clean_names[$i]}" "${clean_paths[$i]}"
+    i=$((i + 1))
+  done
+}
+
+task_switch() {
+  local key selected action name path
+  require git
+  require tmux
+  require fzf
+
+  selected=$(
+    build_rows |
+      fzf \
+        --prompt='TASK › ' \
+        --height='100%' \
+        --layout=reverse \
+        --ansi \
+        --delimiter=$'\t' \
+        --with-nth=4 \
+        --expect=ctrl-n,ctrl-r,ctrl-x
+  ) || return 0
+
+  key=$(printf '%s\n' "$selected" | sed -n '1p')
+  selected=$(printf '%s\n' "$selected" | sed -n '2p')
+
+  if [ "$key" = "ctrl-n" ]; then
+    task_new
+    return
+  fi
+
+  [ -n "$selected" ] || return 0
+
+  action=$(printf '%s' "$selected" | cut -f1)
+  name=$(printf '%s' "$selected" | cut -f2)
+  path=$(printf '%s' "$selected" | cut -f3)
+
+  case "$key" in
+    ctrl-r) task_run "$name" "npm run type-check" ;;
+    ctrl-x) task_archive "$name" "$path" ;;
+    *)
+      case "$action" in
+        switch) task_open "$name" "$path" ;;
+        new) task_new ;;
+        *) echo "task: unknown action: $action" >&2; exit 1 ;;
+      esac
+      ;;
+  esac
+}
+
+main() {
+  local cmd="${1:-switch}"
+  if [ "$#" -gt 0 ]; then shift; fi
+
+  case "$cmd" in
+    switch) task_switch "$@" ;;
+    new) task_new "$@" ;;
+    open) task_open "$@" ;;
+    run) task_run "$@" ;;
+    archive) task_archive "$@" ;;
+    -d|--delete|--archive) task_archive_picker "$@" ;;
+    list) task_list "$@" ;;
+    status) task_status "$@" ;;
+    help|--help|-h) usage ;;
+    *) usage >&2; exit 2 ;;
+  esac
+}
+
+main "$@"
